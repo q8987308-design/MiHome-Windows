@@ -42,6 +42,7 @@ from app.core import cache as device_cache
 from app.core import icon_store, schedule_store
 from app.core.jobs import PRIORITY_CONTROL, PRIORITY_IDLE, JobExecutor
 from app.core.models import DeviceInfo, SceneInfo, is_speaker
+from app.core.room_lights import room_light_devices
 from app.core.scheduler import Scheduler
 from app.core.service import MijiaService
 from app.ui.board_manager import BoardManagerDialog
@@ -200,6 +201,7 @@ class MainWindow(QMainWindow):
         # 探测结论是设备的固有属性，跨家庭/房间/刷新复用；
         # 串行队列 FIFO 保证探测与开关写入的回调顺序不会互相覆盖
         self._known_power: dict[str, bool | None] = {}
+        self._room_light_pending: set[str] = set()
         # did -> 环境读数文案（温湿度），随轮询更新、随网格重建回填
         self._metrics: dict[str, str | None] = {}
         # 耗材明细（全屋口径）：不足项数大于 0 时显示提示胶囊
@@ -388,6 +390,28 @@ class MainWindow(QMainWindow):
             self._status_row.addWidget(pill)
         self._status_row.addStretch(1)
         content.addLayout(self._status_row)
+
+        # Only room lighting is eligible; aggregate scopes never issue writes.
+        self._room_lights_bar = QWidget()
+        self._room_lights_bar.setObjectName("roomLightsBar")
+        light_row = QHBoxLayout(self._room_lights_bar)
+        light_row.setContentsMargins(0, 0, 0, 0)
+        light_row.setSpacing(10)
+        self._room_lights_label = QLabel()
+        light_row.addWidget(self._room_lights_label)
+        light_row.addStretch(1)
+        self._room_lights_on_btn = QPushButton("灯光全开")
+        self._room_lights_off_btn = QPushButton("灯光全关")
+        for button in (self._room_lights_on_btn, self._room_lights_off_btn):
+            button.setCursor(Qt.PointingHandCursor)
+            button.setMinimumHeight(34)
+            light_row.addWidget(button)
+        self._room_lights_on_btn.setObjectName("roomLightsOn")
+        self._room_lights_off_btn.setObjectName("roomLightsOff")
+        self._room_lights_on_btn.clicked.connect(lambda: self._on_room_lights_power(True))
+        self._room_lights_off_btn.clicked.connect(lambda: self._on_room_lights_power(False))
+        self._room_lights_bar.hide()
+        content.addWidget(self._room_lights_bar)
 
         # ---- 卡片滚动区 ----
         self._scroll = QScrollArea()
@@ -1380,6 +1404,7 @@ class MainWindow(QMainWindow):
         )
 
     def _update_count_label(self) -> None:
+        self._update_room_light_controls()
         muted = SiColors.TEXT_MUTED
         # 在线圆点固定为米家绿：它是"在线状态"的语义色，不随主题色变
         online_dot = "#3dbba4"
@@ -1881,6 +1906,8 @@ class MainWindow(QMainWindow):
             known = self._known_power.get(device.did)
             if known is not None:
                 card.set_power_state(known)
+            if device.did in self._room_light_pending:
+                card.set_busy(True)
             if device.did in self._metrics:
                 card.set_metrics(self._metrics.get(device.did))
             # 已下载的图标从本地文件回填：主题/tab 切换重建卡片后
@@ -2041,7 +2068,92 @@ class MainWindow(QMainWindow):
 
     # ---------- 快速开关 ----------
 
+    def _update_room_light_controls(self) -> None:
+        visible = self._current_room not in (_ALL_ROOMS, _SCENE_TAB)
+        self._room_lights_bar.setVisible(visible)
+        specific_home = bool(self._current_home) and self._current_home not in (_ALL_HOMES, "未知")
+        targets = room_light_devices(self._all_devices, self._current_home, self._current_room)
+        all_lights = room_light_devices(self._all_devices, self._current_home,
+                                       self._current_room, online_only=False)
+        offline = len(all_lights) - len(targets)
+        if self._room_light_pending:
+            text = f"正在设置灯光 · 剩余 {len(self._room_light_pending)} 项"
+        elif not specific_home:
+            text = "请先选择具体家庭，再批量控制房间灯光"
+        else:
+            text = f"{self._current_room}灯光 · {len(targets)} 项可控"
+            if offline:
+                text += f" · {offline} 项离线"
+        self._room_lights_label.setText(text)
+        self._room_lights_label.setStyleSheet(f"color: {SiColors.TEXT_MUTED};")
+        self._room_lights_on_btn.setStyleSheet(si_theme.primary_button_qss())
+        self._room_lights_off_btn.setStyleSheet(si_theme.secondary_button_qss())
+        for button in (self._room_lights_on_btn, self._room_lights_off_btn):
+            button.setEnabled(visible and specific_home and bool(targets)
+                              and not self._room_light_pending)
+            button.setToolTip("仅控制本房间在线灯具及名称明确的照明开关；跳过离线设备")
+
+    def _on_room_lights_power(self, target: bool) -> None:
+        if self._room_light_pending:
+            return
+        devices = room_light_devices(self._all_devices, self._current_home, self._current_room)
+        if not devices:
+            self._update_room_light_controls()
+            return
+        all_lights = room_light_devices(self._all_devices, self._current_home,
+                                       self._current_room, online_only=False)
+        # Freeze the scope so switching tabs cannot retarget queued actions.
+        batch = {"home": self._current_home, "room": self._current_room,
+                 "target": target, "total": len(devices), "success": 0,
+                 "failed": [], "offline": len(all_lights) - len(devices)}
+        self._room_light_pending = {d.did for d in devices}
+        for dev in devices:
+            self._bump_power_gen(dev.did)
+            card = self._cards.get(dev.did)
+            if card is not None:
+                card.set_busy(True)
+        self._update_room_light_controls()
+        for dev in devices:
+            self._jobs.submit(
+                lambda d=dev.did: self._service.set_power_state(d, target),
+                on_success=lambda _, d=dev: self._on_room_light_result(batch, d, None),
+                on_error=lambda error, d=dev: self._on_room_light_result(batch, d, error),
+                priority=PRIORITY_CONTROL,
+            )
+
+    def _on_room_light_result(self, batch: dict, device: DeviceInfo,
+                              error: Exception | None) -> None:
+        self._room_light_pending.discard(device.did)
+        self._bump_power_gen(device.did)
+        card = self._cards.get(device.did)
+        if card is not None:
+            card.set_busy(False)
+        if error is None:
+            batch["success"] += 1
+            self._apply_power_state(device.did, batch["target"])
+            if self._board is not None:
+                try:
+                    self._board.apply_power_states({device.did: batch["target"]})
+                except Exception:
+                    logger.warning("同步挂件开关状态失败", exc_info=True)
+        else:
+            batch["failed"].append(f"{device.name}：{error}")
+            logger.warning("房间灯光控制失败 %s: %s", device.name, error)
+        self._update_count_label()
+        if self._room_light_pending:
+            return
+        self._update_tray_devices()
+        action = "全开" if batch["target"] else "全关"
+        summary = (f"{batch['home']} / {batch['room']}灯光{action}："
+                   f"成功 {batch['success']}，失败 {len(batch['failed'])}"
+                   f"，跳过离线 {batch['offline']}")
+        if batch["failed"]:
+            self._show_status(summary + "；" + "；".join(batch["failed"]), 12000)
+        Toast.info(self, summary, 6000)
+
     def _on_power_clicked(self, did: str) -> None:
+        if did in self._room_light_pending:
+            return
         card = self._cards.get(did)
         if card is None:
             return
